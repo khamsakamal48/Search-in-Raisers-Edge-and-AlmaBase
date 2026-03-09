@@ -3,3 +3,7 @@ psycopg2-binary
 rapidfuzz
 jellyfish
 python-dotenv
+watchdog
+pandas
+openpyxl
+sqlalchemy
