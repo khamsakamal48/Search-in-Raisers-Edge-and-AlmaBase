@@ -32,7 +32,7 @@ docker compose up -d --build
 
 - Runs the Streamlit app on port 8501
 - Automatically creates a `.pgpass` file from your `.env` variables (for passwordless `psql`)
-- Sets up a cron job inside the container that refreshes the Raiser's Edge materialized view every night at 8 AM
+- Sets up a cron job inside the container that refreshes the Raiser's Edge materialized view every morning at 8 AM
 
 ### Cron job and .pgpass
 
@@ -119,8 +119,8 @@ crontab -e
 ```
 
 ```cron
-# Refresh Raiser's Edge materialized view every night at 2 AM
-0 2 * * * psql -h your_host -U your_user -d your_database -c "REFRESH MATERIALIZED VIEW CONCURRENTLY raisers_edge_view;" >> /var/log/mv_refresh.log 2>&1
+# Refresh Raiser's Edge materialized view every morning at 8 AM
+0 8 * * * psql -h your_host -U your_user -d your_database -c "REFRESH MATERIALIZED VIEW CONCURRENTLY raisers_edge_view;" >> /var/log/mv_refresh.log 2>&1
 ```
 
 ## Upload AlmaBase Data
