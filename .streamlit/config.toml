@@ -2,7 +2,7 @@
 baseUrlPath = "mapping"
 fileWatcherType = "none"
 runOnSave = false
-maxUploadSize = 500
+maxUploadSize = 300
 
 [browser]
 gatherUsageStats = false
