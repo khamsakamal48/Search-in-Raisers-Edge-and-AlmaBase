@@ -1,2 +1,11 @@
 [server]
-baseUrlPath="mapping"
+baseUrlPath = "mapping"
+fileWatcherType = "none"
+runOnSave = false
+maxUploadSize = 500
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+fastReruns = true

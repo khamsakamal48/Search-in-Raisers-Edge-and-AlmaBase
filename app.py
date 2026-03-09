@@ -316,36 +316,87 @@ def _find_col(table_cols: list[str], target: str) -> str:
     return target
 
 
+# Column name patterns we actually need from the Excel files (out of 592 columns).
+# Reading only these makes the upload ~20x faster.
+_NEEDED_COL_PATTERNS = [
+    r'^Almabase Profile Id$',
+    r'^(First Name|Last Name|Middle Name|Full Name|Prefix)$',
+    r'^Institution \(\d+\)',
+    r'^Department \(\d+\)',
+    r'^Course \(\d+\)',
+    r'^Degree \(\d+\)',
+    r'^Year of Graduation \(\d+\)',
+    r'^Class year \(\d+\)',
+    r'^Class Year \(\d+\)',
+    r'^Roll Number \(\d+\)',
+    r'^Other Education Roll Number \(\d+\)',
+    r'^Roll No Value \(\d+\)',
+    r'^Address \(\d+\)',
+    r'^Email Id \d+',
+    r'^Mobile Phone Number$',
+    r'^Home Phone Number$',
+    r'^Office Phone Number$',
+    r'^Home Mobile$',
+    r'^Home Phone$',
+    r'^Work Mobile$',
+    r'^Work Phone$',
+]
+
+
+def _get_needed_columns(all_columns: list[str]) -> list[str]:
+    """Filter Excel column names to only those needed for the view."""
+    needed = []
+    for col in all_columns:
+        for pat in _NEEDED_COL_PATTERNS:
+            if re.match(pat, col, re.IGNORECASE):
+                needed.append(col)
+                break
+    return needed
+
+
 def upload_almabase_files(uploaded_files) -> tuple[bool, str]:
     """
-    Read uploaded Excel files, concatenate them, upload to almabase_raw table
-    (replacing existing data), and recreate the almabase_view.
-    Returns (success, message).
+    Read uploaded Excel files (only needed columns), concatenate them,
+    upload to almabase_raw table (replacing existing data), and recreate
+    the almabase_view. Returns (success, message).
     """
     try:
+        progress = st.progress(0, text="Reading Excel files...")
         dfs = []
-        for f in uploaded_files:
-            df = pd.read_excel(f, engine="openpyxl")
+        total_files = len(uploaded_files)
+
+        for i, f in enumerate(uploaded_files):
+            progress.progress((i) / (total_files + 2), text=f"Reading file {i + 1}/{total_files}...")
+            # First pass: read only headers to identify needed columns
+            header_df = pd.read_excel(f, engine="openpyxl", nrows=0)
+            needed_cols = _get_needed_columns(list(header_df.columns))
+
+            # Second pass: read only needed columns
+            f.seek(0)
+            df = pd.read_excel(f, engine="openpyxl", usecols=needed_cols)
             dfs.append(df)
 
+        progress.progress(total_files / (total_files + 2), text="Uploading to database...")
         combined = pd.concat(dfs, ignore_index=True)
-
-        # Drop fully empty rows
         combined.dropna(how="all", inplace=True)
 
         engine = _get_sqlalchemy_engine()
 
-        # Upload to database (replace existing table)
-        combined.to_sql(ALMABASE_TABLE, engine, if_exists="replace", index=False)
+        # Upload with batch inserts (much faster than row-by-row default)
+        combined.to_sql(
+            ALMABASE_TABLE, engine, if_exists="replace", index=False,
+            chunksize=1000, method="multi",
+        )
 
-        # Recreate the view
+        progress.progress((total_files + 1) / (total_files + 2), text="Creating view...")
         _create_almabase_view(engine)
 
         # Clear cached filter options so they reload with new data
         load_filter_options.clear()
 
         row_count = len(combined)
-        return True, f"Uploaded {row_count} records from {len(uploaded_files)} file(s)."
+        progress.progress(1.0, text="Done!")
+        return True, f"Uploaded {row_count} records from {total_files} file(s)."
 
     except Exception as e:
         return False, f"Upload failed: {e}"
