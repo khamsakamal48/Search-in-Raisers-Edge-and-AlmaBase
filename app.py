@@ -26,7 +26,7 @@ CONFIGURATION
 import os
 import re
 from urllib.parse import quote_plus
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 import streamlit as st
 import psycopg2
@@ -354,6 +354,18 @@ def _get_needed_columns(all_columns: list[str]) -> list[str]:
     return needed
 
 
+def _read_single_excel(file_bytes: bytes) -> pd.DataFrame:
+    """Read a single Excel file (from bytes) returning only needed columns.
+    This is a top-level function so it can be pickled for ProcessPoolExecutor.
+    """
+    import io
+    buf = io.BytesIO(file_bytes)
+    header_df = pd.read_excel(buf, engine="openpyxl", nrows=0)
+    needed_cols = _get_needed_columns(list(header_df.columns))
+    buf.seek(0)
+    return pd.read_excel(buf, engine="openpyxl", usecols=needed_cols)
+
+
 def upload_almabase_files(uploaded_files) -> tuple[bool, str]:
     """
     Read uploaded Excel files (only needed columns), concatenate them,
@@ -362,19 +374,15 @@ def upload_almabase_files(uploaded_files) -> tuple[bool, str]:
     """
     try:
         progress = st.progress(0, text="Reading Excel files...")
-        dfs = []
         total_files = len(uploaded_files)
 
-        for i, f in enumerate(uploaded_files):
-            progress.progress((i) / (total_files + 2), text=f"Reading file {i + 1}/{total_files}...")
-            # First pass: read only headers to identify needed columns
-            header_df = pd.read_excel(f, engine="openpyxl", nrows=0)
-            needed_cols = _get_needed_columns(list(header_df.columns))
+        # Read all file bytes upfront (UploadedFile objects can't be pickled)
+        file_bytes_list = [f.read() for f in uploaded_files]
 
-            # Second pass: read only needed columns
-            f.seek(0)
-            df = pd.read_excel(f, engine="openpyxl", usecols=needed_cols)
-            dfs.append(df)
+        # Read Excel files in parallel using multiple CPU cores
+        progress.progress(0.1, text=f"Reading {total_files} file(s) in parallel...")
+        with ProcessPoolExecutor() as pool:
+            dfs = list(pool.map(_read_single_excel, file_bytes_list))
 
         progress.progress(total_files / (total_files + 2), text="Uploading to database...")
         combined = pd.concat(dfs, ignore_index=True)
