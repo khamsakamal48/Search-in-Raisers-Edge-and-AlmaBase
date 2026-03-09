@@ -356,14 +356,15 @@ def _get_needed_columns(all_columns: list[str]) -> list[str]:
 
 def _read_single_excel(file_bytes: bytes) -> pd.DataFrame:
     """Read a single Excel file (from bytes) returning only needed columns.
+    Uses calamine (Rust-based) engine for ~10-50x faster parsing than openpyxl.
     This is a top-level function so it can be pickled for ProcessPoolExecutor.
     """
     import io
     buf = io.BytesIO(file_bytes)
-    header_df = pd.read_excel(buf, engine="openpyxl", nrows=0)
+    header_df = pd.read_excel(buf, engine="calamine", nrows=0)
     needed_cols = _get_needed_columns(list(header_df.columns))
     buf.seek(0)
-    return pd.read_excel(buf, engine="openpyxl", usecols=needed_cols)
+    return pd.read_excel(buf, engine="calamine", usecols=needed_cols)
 
 
 def upload_almabase_files(uploaded_files) -> tuple[bool, str]:
