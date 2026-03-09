@@ -6,4 +6,5 @@ python-dotenv
 watchdog
 pandas
 openpyxl
+python-calamine
 sqlalchemy
