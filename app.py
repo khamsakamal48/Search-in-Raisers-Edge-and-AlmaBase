@@ -289,8 +289,8 @@ def _create_almabase_view(engine):
     emails_expr = _simple_concat("emails", email_patterns, table_cols)
     phones_expr = _simple_concat("phones", phone_patterns, table_cols)
 
-    view_sql = f"""
-    CREATE OR REPLACE VIEW almabase_view AS
+    # Use a MATERIALIZED VIEW so we can create GIN indexes for fast search
+    select_sql = f"""
     SELECT
         "{_find_col(table_cols, 'Almabase Profile Id')}" AS almabase_id,
         "{_find_col(table_cols, 'Full Name')}" AS full_name,
@@ -304,7 +304,30 @@ def _create_almabase_view(engine):
     """
 
     with engine.connect() as conn:
-        conn.execute(text(view_sql))
+        conn.execute(text("DROP MATERIALIZED VIEW IF EXISTS almabase_view CASCADE"))
+        conn.execute(text(f"CREATE MATERIALIZED VIEW almabase_view AS {select_sql}"))
+
+        # Create GIN trigram indexes for fast fuzzy search
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_ab_name_trgm "
+            "ON almabase_view USING gin (full_name gin_trgm_ops)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_ab_emails_trgm "
+            "ON almabase_view USING gin (emails gin_trgm_ops)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_ab_phones_trgm "
+            "ON almabase_view USING gin (phones gin_trgm_ops)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_ab_roll_numbers_trgm "
+            "ON almabase_view USING gin (roll_numbers gin_trgm_ops)"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ab_almabase_id "
+            "ON almabase_view (almabase_id)"
+        ))
         conn.commit()
 
 
@@ -394,8 +417,8 @@ def upload_almabase_files(uploaded_files) -> tuple[bool, str]:
         )
         try:
             with conn_raw.cursor() as cur:
-                # Drop view and table
-                cur.execute("DROP VIEW IF EXISTS almabase_view CASCADE")
+                # Drop materialized view and table
+                cur.execute("DROP MATERIALIZED VIEW IF EXISTS almabase_view CASCADE")
                 cur.execute(f"DROP TABLE IF EXISTS {ALMABASE_TABLE}")
 
                 # Create table with correct column types (all TEXT for simplicity)
