@@ -559,27 +559,24 @@ def build_search_query(view_name: str, columns: dict, search_term: str, search_t
         name_col = col["name"]
         filter_clause = _build_filter_clause(col, filters, params)
         params.update({"term": search_term, "threshold": TRGM_THRESHOLD})
+        # Use the % operator (trigram similarity) in WHERE so PostgreSQL
+        # can use the GIN trigram index. soundex/dmetaphone in WHERE
+        # forces a full sequential scan and are applied in Python instead.
         query = f"""
             SELECT *,
                    similarity({name_col}, %(term)s)        AS trgm_sim,
-                   word_similarity(%(term)s, {name_col})    AS trgm_word_sim,
-                   soundex({name_col})                      AS sdx,
-                   dmetaphone({name_col})                   AS dmeta
+                   word_similarity(%(term)s, {name_col})    AS trgm_word_sim
             FROM {view_name}
-            WHERE (similarity({name_col}, %(term)s) > %(threshold)s
-               OR word_similarity(%(term)s, {name_col}) > %(threshold)s
-               OR soundex({name_col}) = soundex(%(term)s)
-               OR dmetaphone({name_col}) = dmetaphone(%(term)s))
+            WHERE {name_col} %% %(term)s
             {filter_clause}
-            ORDER BY similarity({name_col}, %(term)s) DESC
+            ORDER BY {name_col} <-> %(term)s
             LIMIT 50
         """
     elif search_type == "email":
         filter_clause = _build_filter_clause(col, filters, params)
         params["term"] = f"%{search_term}%"
         query = f"""
-            SELECT *, 1.0 AS trgm_sim, 1.0 AS trgm_word_sim,
-                   '' AS sdx, '' AS dmeta
+            SELECT *, 1.0 AS trgm_sim, 1.0 AS trgm_word_sim
             FROM {view_name}
             WHERE {col['email']} ILIKE %(term)s
             {filter_clause}
@@ -592,8 +589,7 @@ def build_search_query(view_name: str, columns: dict, search_term: str, search_t
         params["term"] = f"%{digits}%"
         params["term_raw"] = f"%{search_term}%"
         query = f"""
-            SELECT *, 1.0 AS trgm_sim, 1.0 AS trgm_word_sim,
-                   '' AS sdx, '' AS dmeta
+            SELECT *, 1.0 AS trgm_sim, 1.0 AS trgm_word_sim
             FROM {view_name}
             WHERE regexp_replace({col['phone']}, '[^0-9]', '', 'g') LIKE %(term)s
                OR CAST({col['roll_number']} AS TEXT) ILIKE %(term_raw)s
@@ -605,8 +601,7 @@ def build_search_query(view_name: str, columns: dict, search_term: str, search_t
         filter_clause = _build_filter_clause(col, filters, params)
         params["term"] = f"%{search_term}%"
         query = f"""
-            SELECT *, 1.0 AS trgm_sim, 1.0 AS trgm_word_sim,
-                   '' AS sdx, '' AS dmeta
+            SELECT *, 1.0 AS trgm_sim, 1.0 AS trgm_word_sim
             FROM {view_name}
             WHERE (CAST({col['roll_number']} AS TEXT) ILIKE %(term)s
                OR CAST({col['identifier']} AS TEXT) ILIKE %(term)s)
@@ -728,7 +723,7 @@ def search_view(view_config: dict, search_term: str, search_type: str, filters: 
             confidence = 100.0
 
         # Remove internal scoring columns before display
-        for key in ("trgm_sim", "trgm_word_sim", "sdx", "dmeta"):
+        for key in ("trgm_sim", "trgm_word_sim"):
             row.pop(key, None)
 
         row["confidence"] = confidence
