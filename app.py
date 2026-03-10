@@ -487,9 +487,14 @@ def load_filter_options():
                         f"WHERE TRIM(val) != '' "
                         f"ORDER BY val"
                     )
-                    combined[filter_key].update(
-                        row[0].strip() for row in cur.fetchall() if row[0] and row[0].strip()
-                    )
+                    for row in cur.fetchall():
+                        val = row[0].strip() if row[0] else ""
+                        if not val:
+                            continue
+                        # Normalize float-like year values (e.g. "1989.0" → "1989")
+                        if val.endswith(".0") and val[:-2].isdigit():
+                            val = val[:-2]
+                        combined[filter_key].add(val)
             except psycopg2.Error:
                 pass
 
@@ -639,6 +644,9 @@ def _dedup_csv_values(row: dict) -> dict:
             unique = []
             for item in value.split(", "):
                 item = item.strip()
+                # Normalize float-like year values (e.g. "1989.0" → "1989")
+                if item.endswith(".0") and item[:-2].isdigit():
+                    item = item[:-2]
                 if item and item not in seen:
                     seen.add(item)
                     unique.append(item)
