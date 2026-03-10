@@ -391,6 +391,11 @@ def upload_almabase_files(uploaded_files) -> tuple[bool, str]:
 
         engine = _get_sqlalchemy_engine()
 
+        # Drop the dependent view first, then replace the table
+        with engine.connect() as conn:
+            conn.execute(text("DROP VIEW IF EXISTS almabase_view CASCADE"))
+            conn.commit()
+
         # Upload with batch inserts (much faster than row-by-row default)
         combined.to_sql(
             ALMABASE_TABLE, engine, if_exists="replace", index=False,
