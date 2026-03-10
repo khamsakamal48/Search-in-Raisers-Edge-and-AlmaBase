@@ -548,7 +548,7 @@ def _build_filter_clause(columns: dict, filters: dict, params: dict) -> str:
     return (" AND " + " AND ".join(clauses)) if clauses else ""
 
 
-def build_search_query(view_name: str, columns: dict, search_term: str, search_type: str, filters: dict | None = None):
+def build_search_query(view_name: str, columns: dict, search_term: str, search_type: str, filters: dict | None = None, limit: int = 15):
     """
     Build a parameterized SQL query and params tuple.
 
@@ -575,7 +575,7 @@ def build_search_query(view_name: str, columns: dict, search_term: str, search_t
             WHERE {name_col} %% %(term)s
             {filter_clause}
             ORDER BY {name_col} <-> %(term)s
-            LIMIT 50
+            LIMIT {limit}
         """
     elif search_type == "email":
         filter_clause = _build_filter_clause(col, filters, params)
@@ -585,7 +585,7 @@ def build_search_query(view_name: str, columns: dict, search_term: str, search_t
             FROM {view_name}
             WHERE {col['email']} ILIKE %(term)s
             {filter_clause}
-            LIMIT 50
+            LIMIT {limit}
         """
     elif search_type == "numeric":
         # Could be a phone number or a roll number — search both fields
@@ -600,7 +600,7 @@ def build_search_query(view_name: str, columns: dict, search_term: str, search_t
                OR CAST({col['roll_number']} AS TEXT) ILIKE %(term_raw)s
                OR CAST({col['identifier']} AS TEXT) ILIKE %(term_raw)s
             {filter_clause}
-            LIMIT 50
+            LIMIT {limit}
         """
     else:  # roll_number / identifier (alphanumeric like B21CS042)
         filter_clause = _build_filter_clause(col, filters, params)
@@ -611,7 +611,7 @@ def build_search_query(view_name: str, columns: dict, search_term: str, search_t
             WHERE (CAST({col['roll_number']} AS TEXT) ILIKE %(term)s
                OR CAST({col['identifier']} AS TEXT) ILIKE %(term)s)
             {filter_clause}
-            LIMIT 50
+            LIMIT {limit}
         """
 
     return query, params
@@ -620,9 +620,9 @@ def build_search_query(view_name: str, columns: dict, search_term: str, search_t
 # ---------------------------------------------------------------------------
 # Query execution
 # ---------------------------------------------------------------------------
-def execute_search(view_name: str, columns: dict, search_term: str, search_type: str, filters: dict | None = None):
+def execute_search(view_name: str, columns: dict, search_term: str, search_type: str, filters: dict | None = None, limit: int = 15):
     """Execute the search query and return rows as list of dicts."""
-    query, params = build_search_query(view_name, columns, search_term, search_type, filters)
+    query, params = build_search_query(view_name, columns, search_term, search_type, filters, limit)
     try:
         # Use a dedicated connection per query so parallel searches don't block each other
         conn = psycopg2.connect(
@@ -711,13 +711,13 @@ def compute_combined_score(sql_similarity: float, fuzzy_score: float, phonetic_s
 # ---------------------------------------------------------------------------
 # Orchestration: search a single view
 # ---------------------------------------------------------------------------
-def search_view(view_config: dict, search_term: str, search_type: str, filters: dict | None = None) -> tuple:
+def search_view(view_config: dict, search_term: str, search_type: str, filters: dict | None = None, limit: int = 15) -> tuple:
     """
     Search a single view and return (label, scored_results, error).
     scored_results is a list of dicts with an added 'confidence' key.
     """
     rows, error = execute_search(
-        view_config["name"], view_config["columns"], search_term, search_type, filters
+        view_config["name"], view_config["columns"], search_term, search_type, filters, limit
     )
     if error:
         return view_config["label"], [], error
@@ -822,6 +822,8 @@ def main():
                 if selected:
                     filters[filter_key] = selected
 
+        result_limit = st.slider("Max results per view", min_value=5, max_value=50, value=15, step=5)
+
         st.divider()
 
         # AlmaBase upload section (used occasionally)
@@ -855,8 +857,8 @@ def main():
 
     with st.spinner("Searching…"):
         with ThreadPoolExecutor(max_workers=2) as executor:
-            future_1 = executor.submit(search_view, VIEW_1, search_term, search_type, filters)
-            future_2 = executor.submit(search_view, VIEW_2, search_term, search_type, filters)
+            future_1 = executor.submit(search_view, VIEW_1, search_term, search_type, filters, result_limit)
+            future_2 = executor.submit(search_view, VIEW_2, search_term, search_type, filters, result_limit)
 
             for future in as_completed([future_1, future_2]):
                 label, results, error = future.result()
