@@ -622,16 +622,24 @@ def build_search_query(view_name: str, columns: dict, search_term: str, search_t
 # ---------------------------------------------------------------------------
 def execute_search(view_name: str, columns: dict, search_term: str, search_type: str, filters: dict | None = None):
     """Execute the search query and return rows as list of dicts."""
-    conn = _get_fresh_connection()
-    if conn is None:
-        return None, "Database connection unavailable"
-
     query, params = build_search_query(view_name, columns, search_term, search_type, filters)
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(query, params)
-            rows = cur.fetchall()
-        return [_dedup_csv_values(dict(r)) for r in rows], None
+        # Use a dedicated connection per query so parallel searches don't block each other
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=int(os.getenv("DB_PORT", "5432")),
+            dbname=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+        )
+        conn.set_session(autocommit=True)
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+            return [_dedup_csv_values(dict(r)) for r in rows], None
+        finally:
+            conn.close()
     except psycopg2.Error as e:
         return None, f"Query error: {e}"
 
