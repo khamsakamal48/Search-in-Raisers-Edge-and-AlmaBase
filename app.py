@@ -26,7 +26,7 @@ CONFIGURATION
 import os
 import re
 from urllib.parse import quote_plus
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 import psycopg2
@@ -354,55 +354,71 @@ def _get_needed_columns(all_columns: list[str]) -> list[str]:
     return needed
 
 
-def _read_single_excel(file_bytes: bytes) -> pd.DataFrame:
-    """Read a single Excel file (from bytes) returning only needed columns.
-    Uses calamine (Rust-based) engine for ~10-50x faster parsing than openpyxl.
-    This is a top-level function so it can be pickled for ProcessPoolExecutor.
-    """
-    import io
-    buf = io.BytesIO(file_bytes)
-    header_df = pd.read_excel(buf, engine="calamine", nrows=0)
-    needed_cols = _get_needed_columns(list(header_df.columns))
-    buf.seek(0)
-    return pd.read_excel(buf, engine="calamine", usecols=needed_cols)
-
-
 def upload_almabase_files(uploaded_files) -> tuple[bool, str]:
     """
     Read uploaded Excel files (only needed columns), concatenate them,
     upload to almabase_raw table (replacing existing data), and recreate
     the almabase_view. Returns (success, message).
     """
+    import time
+    import io
+
     try:
         progress = st.progress(0, text="Reading Excel files...")
+        dfs = []
         total_files = len(uploaded_files)
 
-        # Read all file bytes upfront (UploadedFile objects can't be pickled)
-        file_bytes_list = [f.read() for f in uploaded_files]
-
-        # Read Excel files in parallel using multiple CPU cores
-        progress.progress(0.1, text=f"Reading {total_files} file(s) in parallel...")
-        with ProcessPoolExecutor() as pool:
-            dfs = list(pool.map(_read_single_excel, file_bytes_list))
+        t0 = time.time()
+        for i, f in enumerate(uploaded_files):
+            progress.progress((i) / (total_files + 2), text=f"Reading file {i + 1}/{total_files}...")
+            header_df = pd.read_excel(f, engine="calamine", nrows=0)
+            needed_cols = _get_needed_columns(list(header_df.columns))
+            f.seek(0)
+            df = pd.read_excel(f, engine="calamine", usecols=needed_cols)
+            dfs.append(df)
+        t1 = time.time()
 
         progress.progress(total_files / (total_files + 2), text="Uploading to database...")
         combined = pd.concat(dfs, ignore_index=True)
         combined.dropna(how="all", inplace=True)
+        st.toast(f"Read {len(combined)} rows x {len(combined.columns)} cols in {t1-t0:.1f}s")
 
-        engine = _get_sqlalchemy_engine()
-
-        # Drop the dependent view first, then replace the table
-        with engine.connect() as conn:
-            conn.execute(text("DROP VIEW IF EXISTS almabase_view CASCADE"))
-            conn.commit()
-
-        # Upload with batch inserts (much faster than row-by-row default)
-        combined.to_sql(
-            ALMABASE_TABLE, engine, if_exists="replace", index=False,
-            chunksize=1000, method="multi",
+        t2 = time.time()
+        # Use a single psycopg2 connection for all DB operations to avoid lock contention
+        conn_raw = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=int(os.getenv("DB_PORT", "5432")),
+            dbname=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
         )
+        try:
+            with conn_raw.cursor() as cur:
+                # Drop view and table
+                cur.execute("DROP VIEW IF EXISTS almabase_view CASCADE")
+                cur.execute(f"DROP TABLE IF EXISTS {ALMABASE_TABLE}")
+
+                # Create table with correct column types (all TEXT for simplicity)
+                col_defs = ", ".join(f'"{c}" TEXT' for c in combined.columns)
+                cur.execute(f"CREATE TABLE {ALMABASE_TABLE} ({col_defs})")
+
+                # Bulk load with COPY
+                buf = io.StringIO()
+                combined.to_csv(buf, index=False, header=False)
+                buf.seek(0)
+                cols = ", ".join(f'"{c}"' for c in combined.columns)
+                cur.copy_expert(
+                    f"COPY {ALMABASE_TABLE} ({cols}) FROM STDIN WITH (FORMAT CSV, NULL '')",
+                    buf,
+                )
+            conn_raw.commit()
+        finally:
+            conn_raw.close()
+        t3 = time.time()
+        st.toast(f"DB insert: {t3-t2:.1f}s")
 
         progress.progress((total_files + 1) / (total_files + 2), text="Creating view...")
+        engine = _get_sqlalchemy_engine()
         _create_almabase_view(engine)
 
         # Clear cached filter options so they reload with new data
