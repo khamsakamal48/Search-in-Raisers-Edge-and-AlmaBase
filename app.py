@@ -64,6 +64,7 @@ VIEW_1 = {
         "batches": "Batch",
         "emails": "Email(s)",
         "phones": "Phone(s)",
+        "mapped_almabase_id": "AlmaBase ID (from RE)",
     },
 }
 
@@ -79,9 +80,11 @@ VIEW_2 = {
         "department": "departments",    # comma-separated departments (via STRING_AGG)
         "degree": "degrees",            # comma-separated degrees (via STRING_AGG)
         "batch": "batches",             # comma-separated batches (via STRING_AGG)
+        "listed_on_directory": "listed_on_directory",
     },
     "display_names": {
         "almabase_id": "AB ID",
+        "re_constituent_id": "RE ID (from AlmaBase)",
         "full_name": "Name",
         "roll_numbers": "Roll Number(s)",
         "departments": "Department(s)",
@@ -89,6 +92,7 @@ VIEW_2 = {
         "batches": "Batch",
         "emails": "Email(s)",
         "phones": "Phone(s)",
+        "listed_on_directory": "Listed on User Directory",
     },
 }
 
@@ -97,6 +101,9 @@ FILTER_COLUMNS = ["department", "degree", "batch"]
 
 # AlmaBase raw table name (Excel data is uploaded here)
 ALMABASE_TABLE = "almabase_raw"
+
+# RE alias mapping table (CSV with Constituent ID → AlmaBase ID)
+RE_ALIAS_TABLE = "re_alias_mapping"
 
 # Similarity threshold for pg_trgm (lower = more results, less precise)
 TRGM_THRESHOLD = 0.3
@@ -290,6 +297,27 @@ def _create_almabase_view(engine):
     phones_expr = _simple_concat("phones", phone_patterns, table_cols)
 
     # Use a MATERIALIZED VIEW so we can create GIN indexes for fast search
+    # Listed on User Directory column (optional — may not exist in all uploads)
+    listed_col_name = 'is listed on user directory'
+    has_listed_col = any(c.strip().lower().startswith(listed_col_name) for c in table_cols)
+    if has_listed_col:
+        listed_col = next(c for c in table_cols if c.strip().lower().startswith(listed_col_name))
+        listed_expr = f',\n        LOWER(TRIM(CAST("{listed_col}" AS TEXT))) AS listed_on_directory'
+    else:
+        listed_expr = ""
+
+    # Constituent Id column (RE ID stored in AlmaBase, optional)
+    constituent_col_name = 'constituent id'
+    has_constituent_col = any(c.strip().lower() == constituent_col_name for c in table_cols)
+    if has_constituent_col:
+        constituent_col = _find_col(table_cols, 'Constituent Id')
+        constituent_expr = (
+            f',\n        REGEXP_REPLACE(TRIM(CAST("{constituent_col}" AS TEXT)), '
+            f"'\\.0$', '') AS re_constituent_id"
+        )
+    else:
+        constituent_expr = ""
+
     select_sql = f"""
     SELECT
         "{_find_col(table_cols, 'Almabase Profile Id')}" AS almabase_id,
@@ -299,7 +327,7 @@ def _create_almabase_view(engine):
         {degrees_expr},
         {batches_expr},
         {emails_expr},
-        {phones_expr}
+        {phones_expr}{listed_expr}{constituent_expr}
     FROM {ALMABASE_TABLE}
     """
 
@@ -343,6 +371,7 @@ def _find_col(table_cols: list[str], target: str) -> str:
 # Reading only these makes the upload ~20x faster.
 _NEEDED_COL_PATTERNS = [
     r'^Almabase Profile Id$',
+    r'^Constituent Id$',
     r'^(First Name|Last Name|Middle Name|Full Name|Prefix)$',
     r'^Institution \(\d+\)',
     r'^Department \(\d+\)',
@@ -363,6 +392,7 @@ _NEEDED_COL_PATTERNS = [
     r'^Home Phone$',
     r'^Work Mobile$',
     r'^Work Phone$',
+    r'^Is Listed on User Directory',
 ]
 
 
@@ -371,7 +401,7 @@ def _get_needed_columns(all_columns: list[str]) -> list[str]:
     needed = []
     for col in all_columns:
         for pat in _NEEDED_COL_PATTERNS:
-            if re.match(pat, col, re.IGNORECASE):
+            if re.match(pat, col.strip(), re.IGNORECASE):
                 needed.append(col)
                 break
     return needed
@@ -446,6 +476,7 @@ def upload_almabase_files(uploaded_files) -> tuple[bool, str]:
 
         # Clear cached filter options so they reload with new data
         load_filter_options.clear()
+        _almabase_has_column.clear()
 
         row_count = len(combined)
         progress.progress(1.0, text="Done!")
@@ -456,8 +487,124 @@ def upload_almabase_files(uploaded_files) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# RE Alias (AlmaBase ID) CSV upload
+# ---------------------------------------------------------------------------
+def upload_re_alias_file(uploaded_file) -> tuple[bool, str]:
+    """
+    Read a CSV with columns: Constituent ID, Alias Type, Alias.
+    Store Constituent ID and Alias (AlmaBase ID) in re_alias_mapping table.
+    Returns (success, message).
+    """
+    import io
+
+    try:
+        df = pd.read_csv(uploaded_file)
+        # Find the relevant columns case-insensitively
+        col_map = {}
+        for c in df.columns:
+            cl = c.strip().lower()
+            if cl == "constituent id":
+                col_map["constituent_id"] = c
+            elif cl == "alias":
+                col_map["alias"] = c
+
+        if "constituent_id" not in col_map or "alias" not in col_map:
+            return False, "CSV must have 'Constituent ID' and 'Alias' columns."
+
+        mapped = df[[col_map["constituent_id"], col_map["alias"]]].copy()
+        mapped.columns = ["constituent_id", "almabase_id"]
+        mapped.dropna(subset=["constituent_id", "almabase_id"], inplace=True)
+        mapped["constituent_id"] = mapped["constituent_id"].astype(str).str.strip()
+        mapped["almabase_id"] = mapped["almabase_id"].astype(str).str.strip()
+
+        conn_raw = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=int(os.getenv("DB_PORT", "5432")),
+            dbname=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+        )
+        try:
+            with conn_raw.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {RE_ALIAS_TABLE}")
+                cur.execute(
+                    f"CREATE TABLE {RE_ALIAS_TABLE} ("
+                    f"  constituent_id TEXT NOT NULL,"
+                    f"  almabase_id TEXT NOT NULL"
+                    f")"
+                )
+                buf = io.StringIO()
+                mapped.to_csv(buf, index=False, header=False)
+                buf.seek(0)
+                cur.copy_expert(
+                    f"COPY {RE_ALIAS_TABLE} (constituent_id, almabase_id) "
+                    f"FROM STDIN WITH (FORMAT CSV, NULL '')",
+                    buf,
+                )
+                cur.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_re_alias_cid "
+                    f"ON {RE_ALIAS_TABLE} (constituent_id)"
+                )
+            conn_raw.commit()
+        finally:
+            conn_raw.close()
+
+        _re_alias_table_exists.clear()
+        return True, f"Uploaded {len(mapped)} alias mappings."
+
+    except Exception as e:
+        return False, f"Alias upload failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Table existence checks
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=600)
+def _re_alias_table_exists() -> bool:
+    """Check if the re_alias_mapping table exists."""
+    conn = _get_fresh_connection()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM information_schema.tables "
+                f"WHERE table_name = '{RE_ALIAS_TABLE}'"
+            )
+            return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Filter value loading
 # ---------------------------------------------------------------------------
+@st.cache_data(ttl=600)
+def _almabase_has_column(column_name: str) -> bool:
+    """Check if the almabase_view has a specific column."""
+    conn = _get_fresh_connection()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pg_attribute "
+                "WHERE attrelid = 'almabase_view'::regclass "
+                f"AND attname = '{column_name}' AND attnum > 0 AND NOT attisdropped"
+            )
+            return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
+def _almabase_has_listed_column() -> bool:
+    return _almabase_has_column('listed_on_directory')
+
+
+def _almabase_has_re_constituent_id() -> bool:
+    return _almabase_has_column('re_constituent_id')
+
+
 @st.cache_data(ttl=600)
 def load_filter_options():
     """
@@ -548,7 +695,7 @@ def _build_filter_clause(columns: dict, filters: dict, params: dict) -> str:
     return (" AND " + " AND ".join(clauses)) if clauses else ""
 
 
-def build_search_query(view_name: str, columns: dict, search_term: str, search_type: str, filters: dict | None = None, limit: int = 15):
+def build_search_query(view_name: str, columns: dict, search_term: str, search_type: str, filters: dict | None = None, limit: int = 15, listed_on_directory: bool = False):
     """
     Build a parameterized SQL query and params tuple.
 
@@ -559,57 +706,100 @@ def build_search_query(view_name: str, columns: dict, search_term: str, search_t
     col = columns
     filters = filters or {}
     params: dict = {}
+    filter_clause = _build_filter_clause(col, filters, params)
+
+    # Apply "Listed on User Directory" filter (only for views that have the column)
+    listed_col = col.get("listed_on_directory")
+    if listed_on_directory and listed_col:
+        filter_clause += f" AND {listed_col} = 'yes'"
+
+    # For Raiser's Edge view, LEFT JOIN alias mapping to show AlmaBase ID(s)
+    alias_select = ""
+    alias_join = ""
+    has_alias = view_name == VIEW_1["name"] and _re_alias_table_exists()
+    if has_alias:
+        alias_select = ", _alias.mapped_almabase_id"
+        alias_join = (
+            f" LEFT JOIN ("
+            f"   SELECT constituent_id, STRING_AGG(DISTINCT almabase_id, ', ') AS mapped_almabase_id"
+            f"   FROM {RE_ALIAS_TABLE} GROUP BY constituent_id"
+            f" ) _alias"
+            f" ON _alias.constituent_id = CAST({view_name}.{col['identifier']} AS TEXT)"
+        )
+
+    # Cross-view lookup: additional OR conditions for identifier searches
+    # RE view: also search by AlmaBase ID via alias mapping
+    # AlmaBase view: also search by RE ID via re_constituent_id column
+    cross_ref_clause = ""
+    if search_type in ("numeric", "roll_number"):
+        if has_alias:
+            # Searching RE by an AlmaBase ID → match against mapped almabase_ids
+            cross_ref_clause = " OR _alias.mapped_almabase_id ILIKE %(term_xref)s"
+        elif view_name == VIEW_2["name"] and _almabase_has_re_constituent_id():
+            # Searching AlmaBase by an RE ID → match against re_constituent_id
+            cross_ref_clause = " OR CAST(re_constituent_id AS TEXT) ILIKE %(term_xref)s"
+
+    # Qualify column references with view name to avoid ambiguity with alias join
+    v = view_name
 
     if search_type == "name":
         name_col = col["name"]
-        filter_clause = _build_filter_clause(col, filters, params)
         params.update({"term": search_term, "threshold": TRGM_THRESHOLD})
         # Use the % operator (trigram similarity) in WHERE so PostgreSQL
         # can use the GIN trigram index. soundex/dmetaphone in WHERE
         # forces a full sequential scan and are applied in Python instead.
         query = f"""
-            SELECT *,
-                   similarity({name_col}, %(term)s)        AS trgm_sim,
-                   word_similarity(%(term)s, {name_col})    AS trgm_word_sim
-            FROM {view_name}
-            WHERE {name_col} %% %(term)s
+            SELECT {v}.*,
+                   similarity({v}.{name_col}, %(term)s)        AS trgm_sim,
+                   word_similarity(%(term)s, {v}.{name_col})    AS trgm_word_sim
+                   {alias_select}
+            FROM {v}
+            {alias_join}
+            WHERE {v}.{name_col} %% %(term)s
             {filter_clause}
-            ORDER BY {name_col} <-> %(term)s
+            ORDER BY {v}.{name_col} <-> %(term)s
             LIMIT {limit}
         """
     elif search_type == "email":
-        filter_clause = _build_filter_clause(col, filters, params)
         params["term"] = f"%{search_term}%"
         query = f"""
-            SELECT *, 1.0 AS trgm_sim, 1.0 AS trgm_word_sim
-            FROM {view_name}
-            WHERE {col['email']} ILIKE %(term)s
+            SELECT {v}.*, 1.0 AS trgm_sim, 1.0 AS trgm_word_sim
+                   {alias_select}
+            FROM {v}
+            {alias_join}
+            WHERE {v}.{col['email']} ILIKE %(term)s
             {filter_clause}
             LIMIT {limit}
         """
     elif search_type == "numeric":
         # Could be a phone number or a roll number — search both fields
         digits = re.sub(r"[\s\-\+\(\).]", "", search_term)
-        filter_clause = _build_filter_clause(col, filters, params)
         params["term"] = f"%{digits}%"
         params["term_raw"] = f"%{search_term}%"
+        params["term_xref"] = f"%{search_term}%"
         query = f"""
-            SELECT *, 1.0 AS trgm_sim, 1.0 AS trgm_word_sim
-            FROM {view_name}
-            WHERE regexp_replace({col['phone']}, '[^0-9]', '', 'g') LIKE %(term)s
-               OR CAST({col['roll_number']} AS TEXT) ILIKE %(term_raw)s
-               OR CAST({col['identifier']} AS TEXT) ILIKE %(term_raw)s
+            SELECT {v}.*, 1.0 AS trgm_sim, 1.0 AS trgm_word_sim
+                   {alias_select}
+            FROM {v}
+            {alias_join}
+            WHERE (regexp_replace({v}.{col['phone']}, '[^0-9]', '', 'g') LIKE %(term)s
+               OR CAST({v}.{col['roll_number']} AS TEXT) ILIKE %(term_raw)s
+               OR CAST({v}.{col['identifier']} AS TEXT) ILIKE %(term_raw)s
+               {cross_ref_clause})
             {filter_clause}
             LIMIT {limit}
         """
     else:  # roll_number / identifier (alphanumeric like B21CS042)
-        filter_clause = _build_filter_clause(col, filters, params)
         params["term"] = f"%{search_term}%"
+        params["term_xref"] = f"%{search_term}%"
         query = f"""
-            SELECT *, 1.0 AS trgm_sim, 1.0 AS trgm_word_sim
-            FROM {view_name}
-            WHERE (CAST({col['roll_number']} AS TEXT) ILIKE %(term)s
-               OR CAST({col['identifier']} AS TEXT) ILIKE %(term)s)
+            SELECT {v}.*, 1.0 AS trgm_sim, 1.0 AS trgm_word_sim
+                   {alias_select}
+            FROM {v}
+            {alias_join}
+            WHERE (CAST({v}.{col['roll_number']} AS TEXT) ILIKE %(term)s
+               OR CAST({v}.{col['identifier']} AS TEXT) ILIKE %(term)s
+               {cross_ref_clause})
             {filter_clause}
             LIMIT {limit}
         """
@@ -620,9 +810,9 @@ def build_search_query(view_name: str, columns: dict, search_term: str, search_t
 # ---------------------------------------------------------------------------
 # Query execution
 # ---------------------------------------------------------------------------
-def execute_search(view_name: str, columns: dict, search_term: str, search_type: str, filters: dict | None = None, limit: int = 15):
+def execute_search(view_name: str, columns: dict, search_term: str, search_type: str, filters: dict | None = None, limit: int = 15, listed_on_directory: bool = False):
     """Execute the search query and return rows as list of dicts."""
-    query, params = build_search_query(view_name, columns, search_term, search_type, filters, limit)
+    query, params = build_search_query(view_name, columns, search_term, search_type, filters, limit, listed_on_directory)
     try:
         # Use a dedicated connection per query so parallel searches don't block each other
         conn = psycopg2.connect(
@@ -711,13 +901,13 @@ def compute_combined_score(sql_similarity: float, fuzzy_score: float, phonetic_s
 # ---------------------------------------------------------------------------
 # Orchestration: search a single view
 # ---------------------------------------------------------------------------
-def search_view(view_config: dict, search_term: str, search_type: str, filters: dict | None = None, limit: int = 15) -> tuple:
+def search_view(view_config: dict, search_term: str, search_type: str, filters: dict | None = None, limit: int = 15, listed_on_directory: bool = False) -> tuple:
     """
     Search a single view and return (label, scored_results, error).
     scored_results is a list of dicts with an added 'confidence' key.
     """
     rows, error = execute_search(
-        view_config["name"], view_config["columns"], search_term, search_type, filters, limit
+        view_config["name"], view_config["columns"], search_term, search_type, filters, limit, listed_on_directory
     )
     if error:
         return view_config["label"], [], error
@@ -822,6 +1012,17 @@ def main():
                 if selected:
                     filters[filter_key] = selected
 
+        listed_on_directory = False
+
+        st.space(size='xxsmall')
+
+        if _almabase_has_listed_column():
+            listed_on_directory = st.checkbox(
+                "View only Alums listed on AlmaBase's User Directory",
+                value=True,
+                key="listed_on_directory_filter",
+            )
+
         result_limit = st.slider("Max results per view", min_value=5, max_value=50, value=15, step=5)
 
         st.divider()
@@ -843,6 +1044,25 @@ def main():
                 else:
                     st.error(message)
 
+        st.divider()
+
+        # RE Alias mapping upload
+        st.header("RE Alias Upload")
+        alias_file = st.file_uploader(
+            "Upload RE Alias CSV (Constituent ID, Alias Type, Alias)",
+            type=["csv"],
+            accept_multiple_files=False,
+            key="re_alias_upload",
+        )
+        if alias_file:
+            if st.button("Upload Aliases", type="primary"):
+                with st.spinner("Uploading aliases..."):
+                    success, message = upload_re_alias_file(alias_file)
+                if success:
+                    st.success(message)
+                else:
+                    st.error(message)
+
     search_term = st.text_input("Search", placeholder="e.g. Manish Kumar, manish@example.com, 9876543210, B21CS042")
 
     if not search_term or not search_term.strip():
@@ -857,8 +1077,8 @@ def main():
 
     with st.spinner("Searching…"):
         with ThreadPoolExecutor(max_workers=2) as executor:
-            future_1 = executor.submit(search_view, VIEW_1, search_term, search_type, filters, result_limit)
-            future_2 = executor.submit(search_view, VIEW_2, search_term, search_type, filters, result_limit)
+            future_1 = executor.submit(search_view, VIEW_1, search_term, search_type, filters, result_limit, listed_on_directory)
+            future_2 = executor.submit(search_view, VIEW_2, search_term, search_type, filters, result_limit, listed_on_directory)
 
             for future in as_completed([future_1, future_2]):
                 label, results, error = future.result()
