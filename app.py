@@ -424,10 +424,7 @@ def upload_almabase_files(uploaded_files) -> tuple[bool, str]:
         t0 = time.time()
         for i, f in enumerate(uploaded_files):
             progress.progress((i) / (total_files + 2), text=f"Reading file {i + 1}/{total_files}...")
-            header_df = pd.read_excel(f, engine="calamine", nrows=0)
-            needed_cols = _get_needed_columns(list(header_df.columns))
-            f.seek(0)
-            df = pd.read_excel(f, engine="calamine", usecols=needed_cols)
+            df = pd.read_excel(f, engine="calamine")
             dfs.append(df)
         t1 = time.time()
 
@@ -987,47 +984,551 @@ def _display_name(row: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Reviewing section — complete record view
+# ---------------------------------------------------------------------------
+
+_RE_DETAIL_SQL = """
+WITH
+    iitb_schools AS (
+        SELECT constituent_id, class_of, degree, social_organization, known_name, campus AS value
+        FROM school_list WHERE school = 'Indian Institute of Technology Bombay'
+        UNION
+        SELECT constituent_id, class_of, degree, social_organization, known_name, majors_0 AS value
+        FROM school_list WHERE school = 'Indian Institute of Technology Bombay'
+    ),
+    iitb_schools_final AS (
+        SELECT constituent_id,
+            CONCAT_WS(E', ', MAX(class_of), MAX(degree), STRING_AGG(DISTINCT value, E', \\n'),
+                MAX(social_organization), MAX(known_name)) AS iitb_education
+        FROM iitb_schools GROUP BY constituent_id
+    ),
+    dedup_emails AS (
+        SELECT constituent_id,
+            CONCAT(address, CASE WHEN MAX("primary"::int) = 1 THEN ' (Primary)' END) AS address,
+            MAX("primary"::int) AS primary_flag
+        FROM email_list WHERE inactive = FALSE
+        GROUP BY constituent_id, address
+    ),
+    emails AS (
+        SELECT constituent_id, STRING_AGG(address, E', \\n' ORDER BY "primary_flag" DESC) AS emails
+        FROM dedup_emails GROUP BY constituent_id
+    ),
+    dedup_phones AS (
+        SELECT constituent_id,
+            CONCAT(number, CASE WHEN MAX("primary"::int) = 1 THEN ' (Primary)' END) AS number,
+            MAX("primary"::int) AS primary_flag
+        FROM phone_list WHERE inactive = FALSE
+        GROUP BY constituent_id, number
+    ),
+    phones AS (
+        SELECT constituent_id, STRING_AGG(number, E', \\n' ORDER BY "primary_flag" DESC) AS phones
+        FROM dedup_phones GROUP BY constituent_id
+    ),
+    dedup_address AS (
+        SELECT constituent_id,
+            CONCAT(formatted_address, CASE WHEN MAX("preferred"::int) = 1 THEN ' (Primary)' END) AS address,
+            MAX("preferred"::int) AS primary_flag
+        FROM address_list WHERE inactive = FALSE
+        GROUP BY constituent_id, formatted_address
+    ),
+    address AS (
+        SELECT constituent_id, STRING_AGG(address, E'\\n\\n' ORDER BY "primary_flag" DESC) AS address
+        FROM dedup_address GROUP BY constituent_id
+    ),
+    employment AS (
+        SELECT constituent_id,
+            CONCAT(
+                COALESCE(position, ''),
+                CASE WHEN position IS NOT NULL AND name IS NOT NULL THEN ' at ' ELSE '' END,
+                COALESCE(name, ''),
+                CASE
+                    WHEN (start_y IS NOT NULL AND start_m IS NOT NULL AND start_d IS NOT NULL)
+                        OR (end_y IS NOT NULL AND end_m IS NOT NULL AND end_d IS NOT NULL)
+                    THEN CONCAT(' (',
+                        COALESCE(CASE WHEN start_y IS NOT NULL AND start_m IS NOT NULL AND start_d IS NOT NULL
+                            THEN TO_CHAR(MAKE_DATE(start_y::INT, start_m::INT, start_d::INT), 'DD-Mon-YYYY') END, ''),
+                        CASE WHEN (start_y IS NOT NULL AND start_m IS NOT NULL AND start_d IS NOT NULL)
+                            OR (end_y IS NOT NULL AND end_m IS NOT NULL AND end_d IS NOT NULL) THEN ' - ' ELSE '' END,
+                        COALESCE(CASE WHEN end_y IS NOT NULL AND end_m IS NOT NULL AND end_d IS NOT NULL
+                            THEN TO_CHAR(MAKE_DATE(end_y::INT, end_m::INT, end_d::INT), 'DD-Mon-YYYY') END, ''),
+                        ')')
+                    ELSE ''
+                END
+            ) AS employment,
+            MAX(is_primary_business::int) AS primary_flag
+        FROM relationship_list WHERE last_name IS NULL
+        GROUP BY constituent_id, name, position, start_y, start_m, start_d, end_y, end_m, end_d
+    ),
+    employment_final AS (
+        SELECT constituent_id,
+            STRING_AGG(CONCAT(employment, CASE WHEN primary_flag = 1 THEN ' (Primary)' END),
+                E'; \\n' ORDER BY "primary_flag" DESC) AS employment
+        FROM employment GROUP BY constituent_id
+    ),
+    relationships AS (
+        SELECT rl.constituent_id,
+            CONCAT(rl.name, ' (', rl.type, CASE WHEN rl.reciprocal_type IS NOT NULL THEN CONCAT(' / ', rl.reciprocal_type)  ELSE NULL END, ')',
+                CASE WHEN cl.lookup_id IS NOT NULL THEN CONCAT(' - ', cl.lookup_id) ELSE '' END
+            ) AS relationships
+        FROM relationship_list rl
+        LEFT JOIN constituent_list cl ON rl.relation_id = cl.id
+        WHERE rl.last_name IS NOT NULL
+    ),
+    relationships_final AS (
+        SELECT constituent_id, STRING_AGG(relationships, E'; \\n') AS relationships
+        FROM relationships GROUP BY constituent_id
+    ),
+    non_iitb_schools AS (
+        SELECT constituent_id,
+            STRING_AGG(CONCAT_WS(E', ', school, class_of, degree, campus, majors_0), E'; \\n') AS education
+        FROM school_list WHERE school != 'Indian Institute of Technology Bombay'
+        GROUP BY constituent_id
+    ),
+    verified_emails AS (
+        SELECT parent_id, LOWER(value) AS value,
+            STRING_AGG(DISTINCT(CONCAT(comment, ' (', TO_CHAR(date, 'DD-Mon-YYYY'), ')')), ', ') AS source
+        FROM constituent_custom_fields WHERE category = 'Verified Email'
+        GROUP BY parent_id, value
+    ),
+    verified_emails_final AS (
+        SELECT parent_id, STRING_AGG(CONCAT(value, ' (', source, ')'), E'; \\n ') AS emails
+        FROM verified_emails GROUP BY parent_id
+    ),
+    verified_phones AS (
+        SELECT parent_id, value,
+            STRING_AGG(DISTINCT(CONCAT(comment, ' (', TO_CHAR(date, 'DD-Mon-YYYY'), ')')), ', ') AS source
+        FROM constituent_custom_fields WHERE category = 'Verified Phone'
+        GROUP BY parent_id, value
+    ),
+    verified_phones_final AS (
+        SELECT parent_id, STRING_AGG(CONCAT(value, ' (', source, ')'), E'; \\n ') AS phones
+        FROM verified_phones GROUP BY parent_id
+    ),
+    verified_location AS (
+        SELECT parent_id, value,
+            STRING_AGG(DISTINCT(CONCAT(comment, ' (', TO_CHAR(date, 'DD-Mon-YYYY'), ')')), ', ') AS source
+        FROM constituent_custom_fields WHERE category = 'Verified Location'
+        GROUP BY parent_id, value
+    ),
+    verified_location_final AS (
+        SELECT parent_id, STRING_AGG(CONCAT(value, ' (', source, ')'), E'; \\n ') AS location
+        FROM verified_location GROUP BY parent_id
+    ),
+    awards AS (
+        SELECT parent_id,
+            STRING_AGG(DISTINCT(CONCAT(value, ' (', TO_CHAR(date, 'DD-Mon-YYYY'), ')')), E'; \\n') AS award
+        FROM constituent_custom_fields WHERE category = 'Awards'
+        GROUP BY parent_id
+    ),
+    events AS (
+        SELECT parent_id,
+            STRING_AGG(DISTINCT(CONCAT(value, ' (', TO_CHAR(date, 'DD-Mon-YYYY'), ')')), E'; \\n') AS events
+        FROM constituent_custom_fields WHERE category = 'Events Attended'
+        GROUP BY parent_id
+    ),
+    notes_grouped AS (
+        SELECT constituent_id,
+            STRING_AGG(DISTINCT(CONCAT_WS(E' \\n', type, summary, text)), E'\\n\\n') AS notes
+        FROM notes GROUP BY constituent_id
+    ),
+    constituencies AS (
+        SELECT constituent_id, STRING_AGG(DISTINCT description, ', ') AS codes
+        FROM constituent_code_list GROUP BY constituent_id
+    )
+SELECT
+    cl.lookup_id AS "RE ID",
+    TRIM(CONCAT_WS(' ', cl.title, cl.first, cl.middle, cl.last)) AS "Name",
+    cl.former_name AS "Former Name",
+    cl.gender AS "Gender",
+    cl.preferred_name AS "Nickname",
+    cl.marital_status AS "Marital Status",
+    CASE WHEN cl.birthdate_y IS NOT NULL AND cl.birthdate_m IS NOT NULL AND cl.birthdate_d IS NOT NULL
+        THEN MAKE_DATE(cl.birthdate_y::int, cl.birthdate_m::int, cl.birthdate_d::int) END AS "Date of Birth",
+    cl.age AS "Age",
+    cl.deceased AS "Is Deceased?",
+    CASE WHEN cl.deceased_date_y IS NOT NULL AND cl.deceased_date_m IS NOT NULL AND cl.deceased_date_d IS NOT NULL
+        THEN MAKE_DATE(cl.deceased_date_y::int, cl.deceased_date_m::int, cl.deceased_date_d::int) END AS "Deceased Date",
+    iitb.iitb_education AS "Education (IITB)",
+    n_iitb.education AS "Education (non-IITB)",
+    e.emails AS "Email(s)",
+    p.phones AS "Phone(s)",
+    a.address AS "Address(es)",
+    emp.employment AS "Employment(s)",
+    rel.relationships AS "Relationship(s)",
+    v_emails.emails AS "Verified Email(s)",
+    v_phones.phones AS "Verified Phone(s)",
+    v_location.location AS "Verified Location(s)",
+    aw.award AS "Award(s)",
+    ev.events AS "Event(s)",
+    n.notes AS "Notes",
+    co.codes AS "Constituencies"
+FROM constituent_list cl
+    INNER JOIN constituent_code_list ccl ON ccl.constituent_id = cl.id
+    LEFT JOIN emails e ON e.constituent_id = cl.id
+    LEFT JOIN iitb_schools_final iitb ON iitb.constituent_id = cl.id
+    LEFT JOIN phones p ON p.constituent_id = cl.id
+    LEFT JOIN address a ON a.constituent_id = cl.id
+    LEFT JOIN employment_final emp ON emp.constituent_id = cl.id
+    LEFT JOIN relationships_final rel ON rel.constituent_id = cl.id
+    LEFT JOIN non_iitb_schools n_iitb ON n_iitb.constituent_id = cl.id
+    LEFT JOIN verified_emails_final v_emails ON v_emails.parent_id = cl.id
+    LEFT JOIN verified_phones_final v_phones ON v_phones.parent_id = cl.id
+    LEFT JOIN verified_location_final v_location ON v_location.parent_id = cl.id
+    LEFT JOIN awards aw ON aw.parent_id = cl.id
+    LEFT JOIN events ev ON ev.parent_id = cl.id
+    LEFT JOIN notes_grouped n ON n.constituent_id = cl.id
+    LEFT JOIN constituencies co ON co.constituent_id = cl.id
+WHERE cl.type = 'Individual' AND ccl.description = 'Alumni' AND cl.lookup_id = %s
+"""
+
+
+def fetch_re_detail(re_id: str) -> dict | None:
+    """Fetch complete RE data for a single constituent by lookup_id."""
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=int(os.getenv("DB_PORT", "5432")),
+            dbname=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+        )
+        conn.set_session(autocommit=True)
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(_RE_DETAIL_SQL, (re_id,))
+                row = cur.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+    except psycopg2.Error as e:
+        st.error(f"RE detail query error: {e}")
+        return None
+
+
+def fetch_almabase_detail(almabase_id: str) -> dict | None:
+    """Fetch complete AlmaBase data from almabase_raw by Almabase Profile Id."""
+    conn = _get_fresh_connection()
+    if conn is None:
+        return None
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f'SELECT * FROM {ALMABASE_TABLE} WHERE '
+                f'"{_find_col_in_almabase("Almabase Profile Id")}" = %s',
+                (almabase_id,),
+            )
+            row = cur.fetchone()
+        return dict(row) if row else None
+    except psycopg2.Error as e:
+        st.error(f"AlmaBase detail query error: {e}")
+        return None
+
+
+@st.cache_data(ttl=600)
+def _get_almabase_raw_columns() -> list[str]:
+    """Get all column names from almabase_raw table."""
+    conn = _get_fresh_connection()
+    if conn is None:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                f"WHERE table_name = '{ALMABASE_TABLE}' ORDER BY ordinal_position"
+            )
+            return [row[0] for row in cur.fetchall()]
+    except psycopg2.Error:
+        return []
+
+
+def _find_col_in_almabase(target: str) -> str:
+    """Find a column name in almabase_raw case-insensitively."""
+    cols = _get_almabase_raw_columns()
+    for c in cols:
+        if c.lower() == target.lower():
+            return c
+    return target
+
+
+# AlmaBase column grouping patterns for the Reviewing section.
+# Each group: (section_name, list_of_regex_patterns)
+_AB_SECTION_PATTERNS = [
+    ("👤 Basic Information", [
+        r'^Almabase Profile Id$',
+        r'^Constituent Id$',
+        r'^(First Name|Last Name|Middle Name|Full Name|Prefix|Suffix)$',
+        r'^(Gender|Date of Birth|Birthdate|Birthday)$',
+        r'^(Title|Salutation)$',
+        r'(?i)^Birth date$',
+        r'(?i)^Is Deceased$',
+        r'(?i)^Marital Status$',
+    ]),
+    ("🎓 Education", [
+        r'^Institution \(\d+\)',
+        r'^Department \(\d+\)',
+        r'^Course \(\d+\)',
+        r'^Degree \(\d+\)',
+        r'^Year of Graduation \(\d+\)',
+        r'^Class year \(\d+\)',
+        r'^Class Year \(\d+\)',
+        r'^Roll Number \(\d+\)',
+        r'^Other Education Roll Number \(\d+\)',
+        r'^Roll No Value \(\d+\)',
+        r'(?i)Hostel',
+    ]),
+    ("📧 Email(s)", [
+        r'^Email Id \d+',
+        r'^Address \(\d+\)',
+    ]),
+    ("📞 Phone(s)", [
+        r'^Mobile Phone Number',
+        r'^Home Phone Number',
+        r'^Office Phone Number',
+        r'^Home Mobile',
+        r'^Home Phone',
+        r'^Work Mobile',
+        r'^Work Phone',
+    ]),
+    ("💼 Employment", [
+        r'(?i)(employer|company|organization|organisation|job|occupation|position|designation|work.*title)',
+        r'(?i)^(Current|Previous|Past).*(employer|company|organization|organisation)',
+    ]),
+    ("🏠 Address(es)", [
+        r'(?i)^(city|state|country|zip|postal|pin)',
+        r'(?i).*Address',
+        r'(?i).*location',
+        r'(?i).*residence',
+        r'(?i).*Permanent',
+    ]),
+    ("🌐 Social & Online", [
+        r'(?i)(linkedin|twitter|facebook|instagram|github|website|url|social)',
+    ]),
+    ("📖 Chapter", [
+        r'(?i)Chapter',
+    ]),
+    ("⭐ Life Member", [
+        r'(?i)Life Member',
+    ]),
+    ("📋 Directory", [
+        r'^Is Listed on User Directory',
+    ]),
+]
+
+
+def _organize_almabase_data(row: dict) -> list[tuple[str, list[tuple[str, str]]]]:
+    """
+    Group almabase_raw columns into display sections.
+    Returns list of (section_name, [(column_name, value), ...]) where values are non-empty.
+    """
+    assigned = set()
+    sections = []
+
+    for section_name, patterns in _AB_SECTION_PATTERNS:
+        items = []
+        for col, val in row.items():
+            if col in assigned:
+                continue
+            for pat in patterns:
+                if re.match(pat, col, re.IGNORECASE):
+                    if val is not None and str(val).strip():
+                        items.append((col, str(val).strip()))
+                    assigned.add(col)
+                    break
+        if items:
+            sections.append((section_name, items))
+
+    # Collect remaining non-empty columns into "Other Details"
+    other_items = []
+    for col, val in row.items():
+        if col not in assigned and val is not None and str(val).strip():
+            other_items.append((col, str(val).strip()))
+    if other_items:
+        sections.append(("Other Details", other_items))
+
+    return sections
+
+
+# RE detail sections for display grouping
+_RE_SECTIONS = [
+    ("👤 Basic Information", [
+        "RE ID", "Name", "Former Name", "Gender", "Nickname",
+        "Marital Status", "Date of Birth", "Age", "Is Deceased?", "Deceased Date",
+    ]),
+    ("🎓 Education (IITB)", ["Education (IITB)"]),
+    ("🎓 Education (non-IITB)", ["Education (non-IITB)"]),
+    ("📧 Email(s)", ["Email(s)"]),
+    ("📞 Phone(s)", ["Phone(s)"]),
+    ("🏠 Address(es)", ["Address(es)"]),
+    ("💼 Employment(s)", ["Employment(s)"]),
+    ("🤝 Relationship(s)", ["Relationship(s)"]),
+    ("✅ Verified Email(s)", ["Verified Email(s)"]),
+    ("✅ Verified Phone(s)", ["Verified Phone(s)"]),
+    ("✅ Verified Location(s)", ["Verified Location(s)"]),
+    ("🏆 Award(s)", ["Award(s)"]),
+    ("📅 Event(s)", ["Event(s)"]),
+    ("📝 Notes", ["Notes"]),
+    ("🏛️ Constituencies", ["Constituencies"]),
+]
+
+
+def _render_re_detail(data: dict):
+    """Render RE detail data as a series of expanders."""
+    for section_name, fields in _RE_SECTIONS:
+        items = []
+        for f in fields:
+            val = data.get(f)
+            if val is not None and str(val).strip():
+                items.append((f, str(val)))
+        if not items:
+            continue
+        is_basic = section_name == "👤 Basic Information"
+        with st.expander(section_name, expanded=is_basic):
+            for label, value in items:
+                # Multi-line fields: replace \n with line breaks
+                if "\n" in value:
+                    st.markdown(f"**{label}:**")
+                    st.text(value)
+                else:
+                    st.markdown(f"**{label}:** {value}")
+
+
+def _render_almabase_detail(data: dict):
+    """Render AlmaBase detail data organized into sections."""
+    sections = _organize_almabase_data(data)
+    for i, (section_name, items) in enumerate(sections):
+        is_first = i == 0
+        with st.expander(section_name, expanded=is_first):
+            # For Education section, try to render as a table grouped by institution slots
+            if section_name == "🎓 Education":
+                _render_education_table(items)
+            else:
+                for col, val in items:
+                    if "\n" in val:
+                        st.markdown(f"**{col}:**")
+                        st.text(val)
+                    else:
+                        st.markdown(f"**{col}:** {val}")
+
+
+def _render_education_table(items: list[tuple[str, str]]):
+    """Render education items grouped by slot number into a readable table."""
+    # Group items by their slot number: "Institution (1)" → slot 1
+    slots: dict[str, list[tuple[str, str]]] = {}
+    no_slot = []
+    for col, val in items:
+        m = re.search(r'\((\d+)\)', col)
+        if m:
+            slot_num = m.group(1)
+            slots.setdefault(slot_num, []).append((col, val))
+        else:
+            no_slot.append((col, val))
+
+    for slot_num in sorted(slots.keys(), key=int):
+        slot_items = slots[slot_num]
+        # Clean labels: remove " (N)" suffix
+        cleaned = [(re.sub(r'\s*\(\d+\)$', '', col), val) for col, val in slot_items]
+        inst_val = next((v for l, v in cleaned if l.lower() == "institution"), None)
+        header = f"**{inst_val}**" if inst_val else f"**Education Slot {slot_num}**"
+        st.markdown(header)
+        for label, val in cleaned:
+            if label.lower() != "institution" or not inst_val:
+                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{label}: {val}")
+        st.markdown("---")
+
+    for col, val in no_slot:
+        st.markdown(f"**{col}:** {val}")
+
+
+def render_reviewing_section():
+    """Render the Reviewing section — full record view by ID."""
+    st.title("Alumni Review — Complete Record View")
+    st.markdown("Enter an **RE ID** or **AlmaBase ID** to view the complete record.")
+
+    col_re_input, col_ab_input = st.columns(2)
+    with col_re_input:
+        re_id = st.text_input("RE Constituent ID", key="review_re_id",
+                              placeholder="e.g. 12345")
+    with col_ab_input:
+        ab_id = st.text_input("AlmaBase Profile ID", key="review_ab_id",
+                              placeholder="e.g. 67890")
+
+    if not re_id and not ab_id:
+        st.info("Enter an RE ID or AlmaBase ID above to view complete record details.")
+        st.stop()
+
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.subheader("Raiser's Edge")
+        if re_id and re_id.strip():
+            with st.spinner("Loading RE data..."):
+                re_data = fetch_re_detail(re_id.strip())
+            if re_data:
+                _render_re_detail(re_data)
+            else:
+                st.warning(f"No RE record found for ID: {re_id}")
+        else:
+            st.info("Enter an RE ID to view Raiser's Edge data.")
+
+    with col_right:
+        st.subheader("AlmaBase")
+        if ab_id and ab_id.strip():
+            with st.spinner("Loading AlmaBase data..."):
+                ab_data = fetch_almabase_detail(ab_id.strip())
+            if ab_data:
+                _render_almabase_detail(ab_data)
+            else:
+                st.warning(f"No AlmaBase record found for ID: {ab_id}")
+        else:
+            st.info("Enter an AlmaBase ID to view AlmaBase data.")
+
+
+# ---------------------------------------------------------------------------
 # Main app
 # ---------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="Alumni Search", layout="wide")
-    st.title("Alumni Search — Raiser's Edge & AlmaBase")
-    st.markdown("Search by **name**, **email**, **phone number**, **roll number**, or any identifier.")
 
     # --- Sidebar ---
     filter_options = load_filter_options()
     filters = {}
+    listed_on_directory = False
+    result_limit = 15
+
     with st.sidebar:
-        # Filters section (used frequently)
-        st.header("Filters")
-        for filter_key in FILTER_COLUMNS:
-            options = filter_options.get(filter_key, [])
-            if options:
-                selected = st.multiselect(
-                    filter_key.replace("_", " ").title(),
-                    options=options,
-                    default=[],
-                    key=f"filter_{filter_key}",
+        # Navigation
+        page = st.radio("Section", ["Mapping", "Reviewing"], horizontal=True,
+                        label_visibility="collapsed")
+
+        # Mapping-specific sidebar options
+        if page == "Mapping":
+            st.header("Filters")
+            for filter_key in FILTER_COLUMNS:
+                options = filter_options.get(filter_key, [])
+                if options:
+                    selected = st.multiselect(
+                        filter_key.replace("_", " ").title(),
+                        options=options,
+                        default=[],
+                        key=f"filter_{filter_key}",
+                    )
+                    if selected:
+                        filters[filter_key] = selected
+
+            st.space(size='xxsmall')
+
+            if _almabase_has_listed_column():
+                listed_on_directory = st.checkbox(
+                    "View only Alums listed on AlmaBase's User Directory",
+                    value=True,
+                    key="listed_on_directory_filter",
                 )
-                if selected:
-                    filters[filter_key] = selected
 
-        listed_on_directory = False
-
-        st.space(size='xxsmall')
-
-        if _almabase_has_listed_column():
-            listed_on_directory = st.checkbox(
-                "View only Alums listed on AlmaBase's User Directory",
-                value=True,
-                key="listed_on_directory_filter",
-            )
-
-        result_limit = st.slider("Max results per view", min_value=5, max_value=50, value=15, step=5)
+            result_limit = st.slider("Max results per view", min_value=5, max_value=50, value=15, step=5)
 
         st.divider()
 
-        # AlmaBase upload section (used occasionally)
+        # Data upload sections (visible on both pages)
         st.header("AlmaBase Data Upload")
         uploaded_files = st.file_uploader(
             "Upload AlmaBase Excel files",
@@ -1046,7 +1547,6 @@ def main():
 
         st.divider()
 
-        # RE Alias mapping upload
         st.header("RE Alias Upload")
         alias_file = st.file_uploader(
             "Upload RE Alias CSV (Constituent ID, Alias Type, Alias)",
@@ -1062,6 +1562,15 @@ def main():
                     st.success(message)
                 else:
                     st.error(message)
+
+    # --- Main content ---
+    if page == "Reviewing":
+        render_reviewing_section()
+        return
+
+    # --- Mapping page ---
+    st.title("Alumni Mapping — Raiser's Edge & AlmaBase")
+    st.markdown("Search by **name**, **email**, **phone number**, **roll number**, or any identifier.")
 
     search_term = st.text_input("Search", placeholder="e.g. Manish Kumar, manish@example.com, 9876543210, B21CS042")
 
