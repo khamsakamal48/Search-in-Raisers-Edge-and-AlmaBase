@@ -989,12 +989,21 @@ def _display_name(row: dict) -> str:
 
 _RE_DETAIL_SQL = """
 WITH
+    target AS (
+        SELECT cl.id
+        FROM constituent_list cl
+        INNER JOIN constituent_code_list ccl ON ccl.constituent_id = cl.id
+        WHERE cl.type = 'Individual' AND ccl.description = 'Alumni' AND cl.lookup_id = %s
+        LIMIT 1
+    ),
     iitb_schools AS (
         SELECT constituent_id, class_of, degree, social_organization, known_name, campus AS value
         FROM school_list WHERE school = 'Indian Institute of Technology Bombay'
+            AND constituent_id = (SELECT id FROM target)
         UNION
         SELECT constituent_id, class_of, degree, social_organization, known_name, majors_0 AS value
         FROM school_list WHERE school = 'Indian Institute of Technology Bombay'
+            AND constituent_id = (SELECT id FROM target)
     ),
     iitb_schools_final AS (
         SELECT constituent_id,
@@ -1007,6 +1016,7 @@ WITH
             CONCAT(address, CASE WHEN MAX("primary"::int) = 1 THEN ' (Primary)' END) AS address,
             MAX("primary"::int) AS primary_flag
         FROM email_list WHERE inactive = FALSE
+            AND constituent_id = (SELECT id FROM target)
         GROUP BY constituent_id, address
     ),
     emails AS (
@@ -1018,6 +1028,7 @@ WITH
             CONCAT(number, CASE WHEN MAX("primary"::int) = 1 THEN ' (Primary)' END) AS number,
             MAX("primary"::int) AS primary_flag
         FROM phone_list WHERE inactive = FALSE
+            AND constituent_id = (SELECT id FROM target)
         GROUP BY constituent_id, number
     ),
     phones AS (
@@ -1029,6 +1040,7 @@ WITH
             CONCAT(formatted_address, CASE WHEN MAX("preferred"::int) = 1 THEN ' (Primary)' END) AS address,
             MAX("preferred"::int) AS primary_flag
         FROM address_list WHERE inactive = FALSE
+            AND constituent_id = (SELECT id FROM target)
         GROUP BY constituent_id, formatted_address
     ),
     address AS (
@@ -1057,6 +1069,7 @@ WITH
             ) AS employment,
             MAX(is_primary_business::int) AS primary_flag
         FROM relationship_list WHERE last_name IS NULL
+            AND constituent_id = (SELECT id FROM target)
         GROUP BY constituent_id, name, position, start_y, start_m, start_d, end_y, end_m, end_d
     ),
     employment_final AS (
@@ -1073,6 +1086,7 @@ WITH
         FROM relationship_list rl
         LEFT JOIN constituent_list cl ON rl.relation_id = cl.id
         WHERE rl.last_name IS NOT NULL
+            AND rl.constituent_id = (SELECT id FROM target)
     ),
     relationships_final AS (
         SELECT constituent_id, STRING_AGG(relationships, E'; \\n') AS relationships
@@ -1082,12 +1096,14 @@ WITH
         SELECT constituent_id,
             STRING_AGG(CONCAT_WS(E', ', school, class_of, degree, campus, majors_0), E'; \\n') AS education
         FROM school_list WHERE school != 'Indian Institute of Technology Bombay'
+            AND constituent_id = (SELECT id FROM target)
         GROUP BY constituent_id
     ),
     verified_emails AS (
         SELECT parent_id, LOWER(value) AS value,
             STRING_AGG(DISTINCT(CONCAT(comment, ' (', TO_CHAR(date, 'DD-Mon-YYYY'), ')')), ', ') AS source
         FROM constituent_custom_fields WHERE category = 'Verified Email'
+            AND parent_id = (SELECT id FROM target)
         GROUP BY parent_id, value
     ),
     verified_emails_final AS (
@@ -1098,6 +1114,7 @@ WITH
         SELECT parent_id, value,
             STRING_AGG(DISTINCT(CONCAT(comment, ' (', TO_CHAR(date, 'DD-Mon-YYYY'), ')')), ', ') AS source
         FROM constituent_custom_fields WHERE category = 'Verified Phone'
+            AND parent_id = (SELECT id FROM target)
         GROUP BY parent_id, value
     ),
     verified_phones_final AS (
@@ -1108,6 +1125,7 @@ WITH
         SELECT parent_id, value,
             STRING_AGG(DISTINCT(CONCAT(comment, ' (', TO_CHAR(date, 'DD-Mon-YYYY'), ')')), ', ') AS source
         FROM constituent_custom_fields WHERE category = 'Verified Location'
+            AND parent_id = (SELECT id FROM target)
         GROUP BY parent_id, value
     ),
     verified_location_final AS (
@@ -1118,22 +1136,26 @@ WITH
         SELECT parent_id,
             STRING_AGG(DISTINCT(CONCAT(value, ' (', TO_CHAR(date, 'DD-Mon-YYYY'), ')')), E'; \\n') AS award
         FROM constituent_custom_fields WHERE category = 'Awards'
+            AND parent_id = (SELECT id FROM target)
         GROUP BY parent_id
     ),
     events AS (
         SELECT parent_id,
             STRING_AGG(DISTINCT(CONCAT(value, ' (', TO_CHAR(date, 'DD-Mon-YYYY'), ')')), E'; \\n') AS events
         FROM constituent_custom_fields WHERE category = 'Events Attended'
+            AND parent_id = (SELECT id FROM target)
         GROUP BY parent_id
     ),
     notes_grouped AS (
         SELECT constituent_id,
             STRING_AGG(DISTINCT(CONCAT_WS(E' \\n', type, summary, text)), E'\\n\\n') AS notes
-        FROM notes GROUP BY constituent_id
+        FROM notes WHERE constituent_id = (SELECT id FROM target)
+        GROUP BY constituent_id
     ),
     constituencies AS (
         SELECT constituent_id, STRING_AGG(DISTINCT description, ', ') AS codes
-        FROM constituent_code_list GROUP BY constituent_id
+        FROM constituent_code_list WHERE constituent_id = (SELECT id FROM target)
+        GROUP BY constituent_id
     )
 SELECT
     cl.lookup_id AS "RE ID",
@@ -1163,7 +1185,6 @@ SELECT
     n.notes AS "Notes",
     co.codes AS "Constituencies"
 FROM constituent_list cl
-    INNER JOIN constituent_code_list ccl ON ccl.constituent_id = cl.id
     LEFT JOIN emails e ON e.constituent_id = cl.id
     LEFT JOIN iitb_schools_final iitb ON iitb.constituent_id = cl.id
     LEFT JOIN phones p ON p.constituent_id = cl.id
@@ -1178,33 +1199,27 @@ FROM constituent_list cl
     LEFT JOIN events ev ON ev.parent_id = cl.id
     LEFT JOIN notes_grouped n ON n.constituent_id = cl.id
     LEFT JOIN constituencies co ON co.constituent_id = cl.id
-WHERE cl.type = 'Individual' AND ccl.description = 'Alumni' AND cl.lookup_id = %s
+WHERE cl.id = (SELECT id FROM target)
 """
 
 
+@st.cache_data(ttl=300)
 def fetch_re_detail(re_id: str) -> dict | None:
     """Fetch complete RE data for a single constituent by lookup_id."""
+    conn = _get_fresh_connection()
+    if conn is None:
+        return None
     try:
-        conn = psycopg2.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            port=int(os.getenv("DB_PORT", "5432")),
-            dbname=os.getenv("DB_NAME"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-        )
-        conn.set_session(autocommit=True)
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(_RE_DETAIL_SQL, (re_id,))
-                row = cur.fetchone()
-            return dict(row) if row else None
-        finally:
-            conn.close()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(_RE_DETAIL_SQL, (re_id,))
+            row = cur.fetchone()
+        return dict(row) if row else None
     except psycopg2.Error as e:
         st.error(f"RE detail query error: {e}")
         return None
 
 
+@st.cache_data(ttl=300)
 def fetch_almabase_detail(almabase_id: str) -> dict | None:
     """Fetch complete AlmaBase data from almabase_raw by Almabase Profile Id."""
     conn = _get_fresh_connection()

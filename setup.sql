@@ -97,21 +97,48 @@ CREATE INDEX IF NOT EXISTS idx_re_roll_numbers_trgm
 -- ==========================================================================
 
 
--- Raiser's Edge indexes (on the materialized view)
+-- ==========================================================================
+-- 5. Indexes for the RE detail query (Reviewing section)
+-- ==========================================================================
+-- These indexes dramatically speed up the per-constituent detail lookup
+-- by enabling index scans instead of sequential scans on source tables.
 
--- Unique index (required for REFRESH MATERIALIZED VIEW CONCURRENTLY)
-CREATE UNIQUE INDEX IF NOT EXISTS idx_re_constituent_id
-    ON raisers_edge_view (constituent_id);
+CREATE INDEX IF NOT EXISTS idx_cl_lookup_id
+    ON constituent_list (lookup_id);
 
--- Trigram indexes on the materialized view for fuzzy name search
-CREATE INDEX IF NOT EXISTS idx_re_name_trgm
-    ON raisers_edge_view USING gin (full_name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_ccl_constituent_desc
+    ON constituent_code_list (constituent_id, description);
 
-CREATE INDEX IF NOT EXISTS idx_re_emails_trgm
-    ON raisers_edge_view USING gin (emails gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_school_constituent_id
+    ON school_list (constituent_id);
 
-CREATE INDEX IF NOT EXISTS idx_re_phones_trgm
-    ON raisers_edge_view USING gin (phones gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_email_constituent_id
+    ON email_list (constituent_id) WHERE inactive = FALSE;
 
-CREATE INDEX IF NOT EXISTS idx_re_roll_numbers_trgm
-    ON raisers_edge_view USING gin (roll_numbers gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_phone_constituent_id
+    ON phone_list (constituent_id) WHERE inactive = FALSE;
+
+CREATE INDEX IF NOT EXISTS idx_address_constituent_id
+    ON address_list (constituent_id) WHERE inactive = FALSE;
+
+CREATE INDEX IF NOT EXISTS idx_rel_constituent_id
+    ON relationship_list (constituent_id);
+
+CREATE INDEX IF NOT EXISTS idx_ccf_parent_category
+    ON constituent_custom_fields (parent_id, category);
+
+CREATE INDEX IF NOT EXISTS idx_notes_constituent_id
+    ON notes (constituent_id);
+
+
+-- ==========================================================================
+-- 6. Recommended PostgreSQL tuning for this workload
+-- ==========================================================================
+-- Add to postgresql.conf or as Docker environment variables:
+--
+--   work_mem = 64MB              -- default 4MB is too low for CTE-heavy queries
+--   shared_buffers = 256MB       -- 25% of available RAM (adjust for your server)
+--   effective_cache_size = 768MB -- 75% of available RAM
+--   random_page_cost = 1.1       -- if using SSD storage (default 4.0 assumes HDD)
+--   from_collapse_limit = 20     -- help planner with multi-join queries (default 8)
+--   join_collapse_limit = 20     -- same as above
