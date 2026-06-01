@@ -47,6 +47,8 @@ VIEW_1 = {
     "label": "Raiser's Edge",
     "columns": {
         "name": "full_name",            # column containing the person's name
+        "former_name": "former_name",   # former/maiden name
+        "preferred_name": "preferred_name",  # preferred/nick name
         "email": "emails",              # comma-separated emails (via STRING_AGG in view)
         "phone": "phones",             # comma-separated phones (via STRING_AGG in view)
         "identifier": "constituent_id", # primary identifier column
@@ -58,6 +60,8 @@ VIEW_1 = {
     "display_names": {
         "constituent_id": "RE ID",
         "full_name": "Name",
+        "former_name": "Former Name",
+        "preferred_name": "Preferred Name",
         "roll_numbers": "Roll Number(s)",
         "departments": "Department(s)",
         "degrees": "Degree(s)",
@@ -73,6 +77,8 @@ VIEW_2 = {
     "label": "AlmaBase",
     "columns": {
         "name": "full_name",
+        "former_name": "former_name",   # maiden name
+        "preferred_name": "preferred_name",  # nick name
         "email": "emails",             # comma-separated emails (via STRING_AGG in view)
         "phone": "phones",             # comma-separated phones (via STRING_AGG in view)
         "identifier": "almabase_id",
@@ -86,6 +92,8 @@ VIEW_2 = {
         "almabase_id": "AB ID",
         "re_constituent_id": "RE ID (from AlmaBase)",
         "full_name": "Name",
+        "former_name": "Maiden Name",
+        "preferred_name": "Nick Name",
         "roll_numbers": "Roll Number(s)",
         "departments": "Department(s)",
         "degrees": "Degree(s)",
@@ -206,9 +214,10 @@ def _find_education_slots(cols_ordered: list[tuple[str, int]]) -> list[dict]:
 
 
 def _case_when_expr(institution_col: str, data_col: str) -> str:
-    """Build a CASE WHEN expression that only returns the value if institution matches."""
+    """Build a CASE WHEN expression that only returns the value if institution matches or is blank."""
     return (
         f'CASE WHEN "{institution_col}" ILIKE \'%{ALMABASE_INSTITUTION}%\' '
+        f'OR NULLIF(TRIM(CAST("{institution_col}" AS TEXT)), \'\') IS NULL '
         f'THEN NULLIF(TRIM(CAST("{data_col}" AS TEXT)), \'\') END'
     )
 
@@ -296,6 +305,10 @@ def _create_almabase_view(engine):
     emails_expr = _simple_concat("emails", email_patterns, table_cols)
     phones_expr = _simple_concat("phones", phone_patterns, table_cols)
 
+    # Former name (Maiden Name) and preferred name (Nick Name) — single columns
+    former_expr = _simple_concat("former_name", [r'^Maiden Name$'], table_cols)
+    preferred_expr = _simple_concat("preferred_name", [r'^Nick Name$', r'^Nickname$'], table_cols)
+
     # Use a MATERIALIZED VIEW so we can create GIN indexes for fast search
     # Listed on User Directory column (optional — may not exist in all uploads)
     listed_col_name = 'is listed on user directory'
@@ -322,6 +335,8 @@ def _create_almabase_view(engine):
     SELECT
         "{_find_col(table_cols, 'Almabase Profile Id')}" AS almabase_id,
         "{_find_col(table_cols, 'Full Name')}" AS full_name,
+        {former_expr},
+        {preferred_expr},
         {rolls_expr},
         {depts_expr},
         {degrees_expr},
@@ -339,6 +354,14 @@ def _create_almabase_view(engine):
         conn.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_ab_name_trgm "
             "ON almabase_view USING gin (full_name gin_trgm_ops)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_ab_former_name_trgm "
+            "ON almabase_view USING gin (former_name gin_trgm_ops)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_ab_preferred_name_trgm "
+            "ON almabase_view USING gin (preferred_name gin_trgm_ops)"
         ))
         conn.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_ab_emails_trgm "
@@ -373,6 +396,8 @@ _NEEDED_COL_PATTERNS = [
     r'^Almabase Profile Id$',
     r'^Constituent Id$',
     r'^(First Name|Last Name|Middle Name|Full Name|Prefix)$',
+    r'^Maiden Name$',
+    r'^(Nick Name|Nickname)$',
     r'^Institution \(\d+\)',
     r'^Department \(\d+\)',
     r'^Course \(\d+\)',
@@ -692,6 +717,24 @@ def _build_filter_clause(columns: dict, filters: dict, params: dict) -> str:
     return (" AND " + " AND ".join(clauses)) if clauses else ""
 
 
+def _name_search_columns(view_name: str, columns: dict) -> list[str]:
+    """
+    Return the DB columns to match name searches against: the primary name
+    plus former and preferred names. For the AlmaBase view (a rebuilt
+    materialized view), skip extra name columns that don't exist yet so
+    searches keep working before the data is re-uploaded.
+    """
+    cols = [columns["name"]]
+    for key in ("former_name", "preferred_name"):
+        extra = columns.get(key)
+        if not extra:
+            continue
+        if view_name == VIEW_2["name"] and not _almabase_has_column(extra):
+            continue
+        cols.append(extra)
+    return cols
+
+
 def build_search_query(view_name: str, columns: dict, search_term: str, search_type: str, filters: dict | None = None, limit: int = 15, listed_on_directory: bool = False):
     """
     Build a parameterized SQL query and params tuple.
@@ -740,21 +783,28 @@ def build_search_query(view_name: str, columns: dict, search_term: str, search_t
     v = view_name
 
     if search_type == "name":
-        name_col = col["name"]
+        # Search across the primary name plus former and preferred names.
+        # All use the same pg_trgm similarity logic; the GIN trigram index on
+        # each column keeps the % operator fast.
+        name_cols = _name_search_columns(view_name, col)
         params.update({"term": search_term, "threshold": TRGM_THRESHOLD})
+        sim_expr = "GREATEST(" + ", ".join(f"similarity({v}.{c}, %(term)s)" for c in name_cols) + ")"
+        word_sim_expr = "GREATEST(" + ", ".join(f"word_similarity(%(term)s, {v}.{c})" for c in name_cols) + ")"
+        where_expr = " OR ".join(f"{v}.{c} %% %(term)s" for c in name_cols)
+        order_expr = "LEAST(" + ", ".join(f"{v}.{c} <-> %(term)s" for c in name_cols) + ")"
         # Use the % operator (trigram similarity) in WHERE so PostgreSQL
         # can use the GIN trigram index. soundex/dmetaphone in WHERE
         # forces a full sequential scan and are applied in Python instead.
         query = f"""
             SELECT {v}.*,
-                   similarity({v}.{name_col}, %(term)s)        AS trgm_sim,
-                   word_similarity(%(term)s, {v}.{name_col})    AS trgm_word_sim
+                   {sim_expr}        AS trgm_sim,
+                   {word_sim_expr}    AS trgm_word_sim
                    {alias_select}
             FROM {v}
             {alias_join}
-            WHERE {v}.{name_col} %% %(term)s
+            WHERE ({where_expr})
             {filter_clause}
-            ORDER BY {v}.{name_col} <-> %(term)s
+            ORDER BY {order_expr}
             LIMIT {limit}
         """
     elif search_type == "email":
@@ -911,15 +961,19 @@ def search_view(view_config: dict, search_term: str, search_type: str, filters: 
     if not rows:
         return view_config["label"], [], None
 
-    name_col = view_config["columns"]["name"]
+    cols = view_config["columns"]
+    name_keys = ("name", "former_name", "preferred_name")
+    name_cols = [cols[k] for k in name_keys if cols.get(k)]
 
     scored = []
     for row in rows:
-        candidate_name = row.get(name_col, "") or ""
         if search_type == "name":
-            sql_sim = max(float(row.get("trgm_sim", 0)), float(row.get("trgm_word_sim", 0)))
-            fuzzy = compute_fuzzy_score(search_term, candidate_name)
-            phonetic = compute_phonetic_score(search_term, candidate_name)
+            sql_sim = max(float(row.get("trgm_sim") or 0), float(row.get("trgm_word_sim") or 0))
+            # Score against every name variant (primary, former, preferred)
+            # and keep the best — same matching logic for each.
+            candidates = [row.get(c, "") or "" for c in name_cols]
+            fuzzy = max((compute_fuzzy_score(search_term, c) for c in candidates), default=0.0)
+            phonetic = max((compute_phonetic_score(search_term, c) for c in candidates), default=0.0)
             confidence = compute_combined_score(sql_sim, fuzzy, phonetic)
         else:
             # For exact-field searches, give high confidence

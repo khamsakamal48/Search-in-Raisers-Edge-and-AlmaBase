@@ -48,6 +48,8 @@ WITH
 SELECT
     cl.lookup_id::INT                                AS constituent_id,
     CONCAT_WS(' ', cl.first, cl.middle, cl.last)     AS full_name,
+    MAX(cl.former_name)                               AS former_name,
+    MAX(cl.preferred_name)                            AS preferred_name,
     STRING_AGG(DISTINCT edu.known_name, ', ')         AS roll_numbers,
     STRING_AGG(DISTINCT edu.majors_0, ', ')           AS departments,
     STRING_AGG(DISTINCT edu.degree, ', ')             AS degrees,
@@ -70,6 +72,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_re_constituent_id
 -- Trigram indexes on the materialized view for fuzzy name search
 CREATE INDEX IF NOT EXISTS idx_re_name_trgm
     ON raisers_edge_view USING gin (full_name gin_trgm_ops);
+
+CREATE INDEX IF NOT EXISTS idx_re_former_name_trgm
+    ON raisers_edge_view USING gin (former_name gin_trgm_ops);
+
+CREATE INDEX IF NOT EXISTS idx_re_preferred_name_trgm
+    ON raisers_edge_view USING gin (preferred_name gin_trgm_ops);
 
 CREATE INDEX IF NOT EXISTS idx_re_emails_trgm
     ON raisers_edge_view USING gin (emails gin_trgm_ops);
